@@ -16,6 +16,7 @@ import streamlit as st
 
 import acesso
 import casa
+import faturas
 import previsao as pv
 import storage
 from estilo import CSS
@@ -505,9 +506,139 @@ def pagina_produtos(dados: dict, an: dict):
                   icon=":material/delete:")
 
 
+def config_ia() -> dict | None:
+    """Configuração da leitura de talões em st.secrets["ia"] (None = desativada)."""
+    try:
+        s = dict(st.secrets["ia"])
+    except Exception:
+        return None
+    chave = s.get("chave_gemini") or s.get("api_key") or s.get("gemini_api_key")
+    if not chave:
+        return None
+    return {"chave": chave, "modelo": s.get("modelo") or faturas.MODELO_PADRAO,
+            "limite": int(s.get("limite_diario", 20))}
+
+
+def _limpar_talao():
+    st.session_state.pop("talao", None)
+    st.session_state["talao_n"] = st.session_state.get("talao_n", 0) + 1  # repõe o carregador
+
+
+def _texto(v) -> str:
+    return "" if v is None or (isinstance(v, float) and v != v) else " ".join(str(v).split())
+
+
+def seccao_talao(dados: dict):
+    cfg = config_ia()
+    if not cfg:
+        st.markdown("<div class='aprender'><b>A leitura de talões ainda não está ativa</b><p>É preciso juntar "
+                    "uma chave gratuita do Google Gemini nos «Secrets» da aplicação (veja o README). Entretanto, use "
+                    "«Escrever à mão».</p></div>", unsafe_allow_html=True)
+        return
+    if st.session_state.get("talao"):
+        revisao_talao(dados)
+        return
+
+    n = st.session_state.get("talao_n", 0)
+    f = st.file_uploader("Fotografia ou PDF do talão", type=["jpg", "jpeg", "png", "webp", "pdf"],
+                         key=f"talao_ficheiro_{n}")
+    st.caption("No telemóvel pode tirar a fotografia na hora. Talão inteiro, direito, bem esticado e com boa luz.")
+    if f is None:
+        return
+    usadas = casa.leituras_hoje(dados, hoje_iso())
+    if usadas >= cfg["limite"]:
+        st.warning(f"Já foram lidos {usadas} talões hoje nesta casa, que é o limite diário. "
+                   "Amanhã pode ler mais; hoje use «Escrever à mão».")
+        return
+    if not st.button("Ler talão", icon=":material/document_scanner:", type="primary"):
+        return
+    nomes = [p["nome"] for p in dados["produtos"].values()]
+    with st.spinner("A ler o talão… pode demorar uns segundos."):
+        try:
+            talao = faturas.ler_talao(f.getvalue(), f.name, f.type, nomes, cfg["chave"], agora().date(),
+                                      cfg["modelo"])
+        except faturas.ErroLeitura as e:
+            st.error(str(e), icon=":material/error:")
+            return
+    executar(lambda d: casa.registar_leitura(d, hoje_iso()))
+    if not talao["legivel"]:
+        st.error("Não consegui encontrar artigos neste talão. Tente uma fotografia mais nítida, "
+                 "com o talão todo à vista.", icon=":material/error:")
+        return
+    st.session_state["talao"] = {"loja": talao["loja"], "data": talao["data"],
+                                 "linhas": faturas.linhas_para_revisao(dados, talao)}
+    st.rerun()
+
+
+def revisao_talao(dados: dict):
+    import pandas as pd
+
+    rev = st.session_state["talao"]
+    n = st.session_state.get("talao_n", 0)
+    titulo = "Confirme o talão" + (f" do {rev['loja']}" if rev["loja"] else "")
+    st.markdown(f"<p class='secao'>{esc(titulo)}</p>", unsafe_allow_html=True)
+    st.caption("Corrija os nomes e as quantidades, tire o visto ao que não interessa (sacos, por exemplo) "
+               "e acrescente o que faltar na última linha.")
+
+    hoje = agora().date()
+    data_ini = datetime.fromisoformat(rev["data"]).date() if rev["data"] else hoje
+    data = st.date_input("Data da compra", value=data_ini, key=f"talao_data_{n}", format="DD/MM/YYYY",
+                         max_value=hoje)
+    if not rev["data"]:
+        st.caption("Não encontrei a data no talão: confirme-a acima.")
+
+    df = pd.DataFrame(rev["linhas"], columns=["incluir", "produto", "quantidade", "associacao", "talao"])
+    editado = st.data_editor(
+        df, key=f"talao_tabela_{n}", num_rows="dynamic", hide_index=True,
+        column_config={
+            "incluir": st.column_config.CheckboxColumn("✓", default=True, width="small"),
+            "produto": st.column_config.TextColumn("Produto", width="medium"),
+            "quantidade": st.column_config.NumberColumn("Qtd.", min_value=1, max_value=99, step=1, default=1,
+                                                        width="small"),
+            "associacao": st.column_config.TextColumn("", disabled=True, width="small"),
+            "talao": st.column_config.TextColumn("No talão", disabled=True),
+        })
+
+    linhas = []
+    for _, r in editado.iterrows():
+        nome = _texto(r.get("produto"))
+        inc = r.get("incluir")
+        incluido = True if inc is None or (isinstance(inc, float) and inc != inc) else bool(inc)
+        if not nome or not incluido:
+            continue
+        q = r.get("quantidade")
+        q = 1 if q is None or (isinstance(q, float) and q != q) else max(1, int(q))
+        linhas.append({"produto": nome, "quantidade": q, "talao": _texto(r.get("talao"))})
+    novos = sorted({l["produto"] for l in linhas if not casa.encontrar_produto(dados, l["produto"])},
+                   key=casa.normalizar)
+    resumo = f"Vai registar {len(linhas)} produto(s) com a data {data.strftime('%d/%m/%Y')}."
+    if novos:
+        resumo += f" Produtos novos: {', '.join(novos)}."
+    st.markdown(cinza(resumo), unsafe_allow_html=True)
+
+    a, b = st.columns([3, 2])
+    if a.button(f"Guardar {len(linhas)} compras", icon=":material/check:", type="primary",
+                disabled=not linhas, key=f"talao_guardar_{n}"):
+        ids = executar(lambda d: casa.registar_varias(d, linhas, data.isoformat(), hoje_iso()),
+                       f"Registou {len(linhas)} compras do talão")
+        if ids:
+            _limpar_talao()
+            st.session_state["aviso"] = f"Talão guardado: {len(linhas)} compras registadas."
+        st.rerun()
+    b.button("Cancelar", key=f"talao_cancelar_{n}", on_click=_limpar_talao)
+
+
 def pagina_nova_compra(dados: dict, an: dict):
-    cabecalho_pagina("Registar compra", "Só precisa do produto. A quantidade e a data já vêm preenchidas.")
+    cabecalho_pagina("Registar compra", "Leia o talão de uma vez, ou escreva um produto de cada vez.")
     mensagens()
+    t_talao, t_manual = st.tabs(["Ler talão", "Escrever à mão"])
+    with t_talao:
+        seccao_talao(dados)
+    with t_manual:
+        formulario_manual(dados)
+    compras_recentes_lista(dados)
+
+def formulario_manual(dados: dict):
     s = st.session_state
     s.setdefault("f_qtd", 1)
     s.setdefault("f_data", agora().date())
@@ -523,13 +654,16 @@ def pagina_nova_compra(dados: dict, an: dict):
                      help=f"Automática: {casa.adivinhar_categoria(s['f_produto'])}")
     st.button("Guardar compra", icon=":material/check:", on_click=acao_registar_compra, type="primary")
 
+
+def compras_recentes_lista(dados: dict):
     recentes = casa.compras_recentes(dados)
     if recentes:
         st.markdown("<p class='secao'>Compras recentes</p>", unsafe_allow_html=True)
         for c in recentes:
             p = dados["produtos"][c["produto_id"]]
             r = {"nome": p["nome"], "icone": casa.icone(p.get("categoria"))}
-            linha_info(f"r_{c['id']}", r, cinza(fmt_data(c["data"])), fmt_qtd(c["quantidade"]))
+            extra = fmt_data(c["data"]) + (" · talão" if c.get("origem") == "talao" else "")
+            linha_info(f"r_{c['id']}", r, cinza(extra), fmt_qtd(c["quantidade"]))
 
 
 def seccao_casa(dados: dict):

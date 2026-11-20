@@ -4,6 +4,7 @@
 * Lista «Em breve» e «Lista do mês», compras a dobrar, produtos que deixaram de se comprar
 * Acesso por e-mail + código, e separação dos dados entre casas (local e GitHub)
 * Conversão de ficheiros da versão anterior (com stock)
+* Leitura de talões: preparação da imagem/PDF, pedido ao Gemini (simulado), associação a produtos
 """
 import base64
 import json
@@ -13,6 +14,7 @@ from pathlib import Path
 
 import acesso
 import casa
+import faturas
 import previsao as pv
 import storage
 
@@ -196,6 +198,167 @@ def teste_migracao_v1():
     print("OK: conversão de ficheiros da versão anterior")
 
 
+def _imagem_talao(largura, altura):
+    import io
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (largura, altura), "white").save(buf, "PNG")
+    return buf.getvalue()
+
+
+def teste_preparar_ficheiros():
+    # talão comprido (3000 x 12000) -> reduzido para 1200 de largura e partido em partes com sobreposição
+    blocos = faturas.preparar_ficheiro(_imagem_talao(3000, 12000), "talao.png", "image/png")
+    assert 2 <= len(blocos) <= faturas.MAX_PARTES
+    assert all(b["inline_data"]["mime_type"] == "image/jpeg" for b in blocos)
+    assert sum(len(b["inline_data"]["data"]) for b in blocos) < 20_000_000  # limite do pedido inline
+    # fotografia normal -> uma só imagem
+    assert len(faturas.preparar_ficheiro(_imagem_talao(1000, 1200), "foto.jpg", "image/jpeg")) == 1
+    # PDF -> bloco document
+    pdf = faturas.preparar_ficheiro(b"%PDF-1.4 teste", "fatura.pdf", "application/pdf")
+    assert pdf[0]["inline_data"]["mime_type"] == "application/pdf"
+    for nome, mime in (("x.heic", "image/heic"), ("x.txt", "text/plain")):
+        try:
+            faturas.preparar_ficheiro(b"123", nome, mime)
+            raise AssertionError("devia recusar " + nome)
+        except faturas.ErroLeitura:
+            pass
+    pedido = faturas.montar_pedido(blocos, ["Leite meio-gordo", "Pão"])
+    cfg = pedido["generationConfig"]
+    assert cfg["responseMimeType"] == "application/json" and cfg["responseJsonSchema"] is faturas.ESQUEMA
+    partes = pedido["contents"][0]["parts"]
+    assert "Leite meio-gordo" in partes[-1]["text"] and f"{len(blocos)} partes" in partes[-1]["text"]
+    assert pedido["systemInstruction"]["parts"][0]["text"] == faturas.INSTRUCOES
+    print(f"OK: preparação de ficheiros (talão comprido em {len(blocos)} partes, PDF, formatos recusados)")
+
+
+class _RespAPI:
+    def __init__(self, code, data):
+        self.status_code, self._d = code, data
+
+    def json(self):
+        return self._d
+
+
+class GeminiFalso:
+    """Imita o generateContent do Gemini: devolve o talão como texto JSON.
+
+    erros: {modelo: (código HTTP, status)} para simular modelos indisponíveis ou quota esgotada.
+    """
+
+    def __init__(self, entrada, erros=None, texto=None):
+        self.entrada, self.erros, self.texto, self.pedidos = entrada, erros or {}, texto, []
+
+    def post(self, url, json=None, timeout=None, headers=None):
+        modelo = url.split("/models/")[1].split(":")[0]
+        self.pedidos.append((modelo, json, headers))
+        if modelo in self.erros:
+            codigo, estado, msg = self.erros[modelo]
+            return _RespAPI(codigo, {"error": {"code": codigo, "status": estado, "message": msg}})
+        import json as _json
+        texto = self.texto if self.texto is not None else _json.dumps(self.entrada, ensure_ascii=False)
+        return _RespAPI(200, {"candidates": [{"content": {"role": "model", "parts": [{"text": texto}]},
+                                              "finishReason": "STOP"}]})
+
+
+TALAO = {
+    "legivel": True, "loja": "Continente", "data": "18-11-2026",
+    "linhas": [
+        {"texto": "LEITE MIMOSA M/G 1L", "nome": "Leite meio-gordo Mimosa", "quantidade": 6, "tipo": "produto"},
+        {"texto": "IOG NAT DANONE X4", "nome": "Iogurte natural Danone", "quantidade": "2", "tipo": "produto"},
+        {"texto": "PAO FORMA", "nome": "Pão de forma", "quantidade": 1, "tipo": "produto", "existente": "Pão"},
+        {"texto": "OVOS M", "nome": "Ovos", "quantidade": 1, "tipo": "produto", "existente": ""},
+        {"texto": "BANANA KG", "nome": "Banana", "quantidade": 0.734, "tipo": "produto"},
+        {"texto": "AZEITE GALLO 750ML", "nome": "Azeite Gallo", "quantidade": 1, "tipo": "produto"},
+        {"texto": "LEITE MIMOSA M/G 1L", "nome": "Leite meio-gordo Mimosa", "quantidade": 2, "tipo": "produto"},
+        {"texto": "SACO REUTILIZAVEL", "nome": "Saco", "quantidade": 1, "tipo": "saco"},
+    ]}
+
+
+def teste_ler_talao():
+    hoje = date(2026, 11, 20)
+    h = hoje.isoformat()
+    dados = casa.dados_novos({}, h)
+    for nome in ("Leite meio-gordo", "Iogurtes naturais", "Pão", "Bananas"):
+        casa.obter_ou_criar_produto(dados, nome, h)
+
+    api = GeminiFalso(TALAO)
+    talao = faturas.ler_talao(b"%PDF-1.4", "f.pdf", "application/pdf", ["Leite meio-gordo"], "AIza-teste", hoje,
+                              sessao=api)
+    modelo, pedido, cab = api.pedidos[0]
+    assert modelo == faturas.MODELO_PADRAO and cab["x-goog-api-key"] == "AIza-teste"
+    assert talao["data"] == "2026-11-18" and talao["loja"] == "Continente"
+    assert [l["quantidade"] for l in talao["linhas"]][:5] == [6, 2, 1, 1, 1]  # «2» texto e banana a peso
+    assert talao["linhas"][3]["existente"] is None                              # "" -> sem sugestão
+
+    linhas = faturas.linhas_para_revisao(dados, talao)
+    por = {l["talao"]: l for l in linhas}
+    assert por["LEITE MIMOSA M/G 1L"]["produto"] == "Leite meio-gordo"
+    assert por["LEITE MIMOSA M/G 1L"]["quantidade"] == 8               # duas linhas juntas
+    assert por["IOG NAT DANONE X4"]["produto"] == "Iogurtes naturais"
+    assert por["PAO FORMA"]["produto"] == "Pão"                         # sugestão do modelo
+    assert por["BANANA KG"]["produto"] == "Bananas"
+    assert por["AZEITE GALLO 750ML"]["associacao"] == "Novo" and por["OVOS M"]["associacao"] == "Novo"
+    assert por["SACO REUTILIZAVEL"]["incluir"] is False
+    print("Revisão:", [(l["produto"], l["quantidade"], l["associacao"], l["incluir"]) for l in linhas])
+
+    # a utilizadora corrige o azeite para «Azeite» e grava sem o saco
+    a_gravar = [{"produto": "Azeite" if l["talao"].startswith("AZEITE") else l["produto"],
+                 "quantidade": l["quantidade"], "talao": l["talao"]} for l in linhas if l["incluir"]]
+    ids = casa.registar_varias(dados, a_gravar, talao["data"], h)
+    assert len(ids) == 6 and all(c["origem"] == "talao" for c in dados["compras"])
+    assert sum(c["quantidade"] for c in dados["compras"]) == 8 + 2 + 1 + 1 + 1 + 1
+
+    # próxima vez: «AZEITE GALLO 750ML» vai logo para «Azeite» (memória), mesmo que o modelo diga outra coisa
+    outro = {"texto": "AZEITE GALLO 750ML", "nome": "Azeite virgem extra", "quantidade": 1, "tipo": "produto"}
+    pid, nome, como = faturas.associar(dados, outro)
+    assert nome == "Azeite" and como == "memória"
+
+    # produtos diferentes não se juntam por engano
+    casa.obter_ou_criar_produto(dados, "Leite magro", h)
+    assert faturas.associar(dados, {"texto": "LEITE AGROS MAGRO", "nome": "Leite magro Agros"})[1] == "Leite magro"
+    assert faturas.associar(dados, {"texto": "MANTEIGA S/SAL", "nome": "Manteiga sem sal"})[2] == "novo"
+
+    # limite diário
+    casa.registar_leitura(dados, h)
+    casa.registar_leitura(dados, h)
+    assert casa.leituras_hoje(dados, h) == 2 and casa.leituras_hoje(dados, "2026-11-21") == 0
+
+    # modelo preferido indisponível (404) e o seguinte sem quota (429) -> usa o terceiro da lista
+    api = GeminiFalso(TALAO, erros={
+        "gemini-3.8-flash": (404, "NOT_FOUND", "models/gemini-3.8-flash is not found"),
+        "gemini-3.5-flash-lite": (429, "RESOURCE_EXHAUSTED", "Quota exceeded per minute")})
+    t2 = faturas.ler_talao(b"%PDF", "f.pdf", None, [], "x", hoje, sessao=api)
+    assert [p[0] for p in api.pedidos] == faturas.MODELOS_ALTERNATIVOS and t2["loja"] == "Continente"
+
+    # resposta entre ```json … ``` também é aceite
+    api = GeminiFalso(TALAO, texto="```json\n" + json.dumps(TALAO) + "\n```")
+    assert faturas.ler_talao(b"%PDF", "f.pdf", None, [], "x", hoje, sessao=api)["loja"] == "Continente"
+
+    # erros com mensagens claras
+    casos = [
+        ({m: (400, "INVALID_ARGUMENT", "API key not valid. Please pass a valid API key.")
+          for m in faturas.MODELOS_ALTERNATIVOS}, "chave", 1),
+        ({m: (429, "RESOURCE_EXHAUSTED", "Quota exceeded for GenerateRequestsPerDayPerProjectPerModel-FreeTier")
+          for m in faturas.MODELOS_ALTERNATIVOS}, "diária", 3),
+        ({m: (503, "UNAVAILABLE", "The model is overloaded") for m in faturas.MODELOS_ALTERNATIVOS},
+         "sobrecarregado", 3),
+    ]
+    for erros, palavra, n_pedidos in casos:
+        api = GeminiFalso(TALAO, erros=erros)
+        try:
+            faturas.ler_talao(b"%PDF", "f.pdf", None, [], "x", hoje, sessao=api)
+            raise AssertionError("devia falhar")
+        except faturas.ErroLeitura as e:
+            assert palavra in str(e) and len(api.pedidos) == n_pedidos, (str(e), len(api.pedidos))
+    try:
+        faturas.ler_talao(b"%PDF", "f.pdf", None, [], "x", hoje, sessao=GeminiFalso(TALAO, texto="isto não é json"))
+        raise AssertionError("devia falhar")
+    except faturas.ErroLeitura:
+        pass
+    print("OK: leitura de talão (Gemini simulado), modelos alternativos, associação, memória, limite diário, erros")
+
+
 if __name__ == "__main__":
     teste_frequencia()
     teste_aprendizagem_inicial()
@@ -203,3 +366,5 @@ if __name__ == "__main__":
     teste_casas_separadas_local()
     teste_github()
     teste_migracao_v1()
+    teste_preparar_ficheiros()
+    teste_ler_talao()

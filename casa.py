@@ -12,8 +12,10 @@ Cada casa tem o seu próprio ficheiro JSON:
   },
   "compras": [
      {"id": "…", "produto_id": "a1b2c3d4e5", "quantidade": 6, "data": "2026-11-20",
-      "registado_em": "2026-11-20T15:30:00+00:00"}
-  ]
+      "registado_em": "2026-11-20T15:30:00+00:00", "origem": "talao"}   # origem opcional
+  ],
+  "aliases": {"leite mimosa m g 1l": "a1b2c3d4e5"},   # texto de talão -> produto (aprendido)
+  "leituras": {"2026-11-20": 3}                      # talões lidos por dia (limite diário)
 }
 """
 from __future__ import annotations
@@ -91,7 +93,8 @@ def icone(categoria: str | None) -> str:
 
 # ---------------------------------------------------------------- estrutura
 def dados_novos(info_casa: dict, hoje_iso: str) -> dict:
-    return {"versao": VERSAO, "criado_em": hoje_iso, "casa": dict(info_casa), "produtos": {}, "compras": []}
+    return {"versao": VERSAO, "criado_em": hoje_iso, "casa": dict(info_casa), "produtos": {}, "compras": [],
+            "aliases": {}, "leituras": {}}
 
 
 def preparar(dados: dict | None, hoje_iso: str | None = None) -> dict | None:
@@ -102,6 +105,8 @@ def preparar(dados: dict | None, hoje_iso: str | None = None) -> dict | None:
     dados.setdefault("criado_em", hoje_iso)
     dados.setdefault("casa", {})
     dados.setdefault("produtos", {})
+    dados.setdefault("aliases", {})
+    dados.setdefault("leituras", {})
     if "compras" not in dados:  # versão 1: só as entradas de stock eram compras
         dados["compras"] = [
             {"id": m["id"], "produto_id": m["produto_id"], "quantidade": abs(m["quantidade"]),
@@ -145,6 +150,7 @@ def editar_produto(dados: dict, pid: str, nome: str | None = None, categoria: st
 def apagar_produto(dados: dict, pid: str):
     dados["produtos"].pop(pid, None)
     dados["compras"] = [c for c in dados["compras"] if c["produto_id"] != pid]
+    dados["aliases"] = {k: v for k, v in dados.get("aliases", {}).items() if v != pid}
 
 
 # ------------------------------------------------------------------- compras
@@ -158,6 +164,44 @@ def registar_compra(dados: dict, nome_ou_pid: str, quantidade: float | None, dat
     c = {"id": novo_id(), "produto_id": pid, "quantidade": q, "data": data_iso, "registado_em": agora_iso()}
     dados["compras"].append(c)
     return [c["id"]]
+
+
+def chave_alias(texto_talao: str) -> str:
+    return normalizar(texto_talao)
+
+
+def registar_varias(dados: dict, linhas: list[dict], data_iso: str, hoje_iso: str,
+                    origem: str = "talao") -> list[str]:
+    """Regista várias compras de uma vez (ex.: um talão).
+
+    linhas: [{"produto": nome, "quantidade": n, "talao": texto do talão ou ""}]
+    Junta linhas do mesmo produto e memoriza «texto do talão -> produto» para a próxima vez.
+    """
+    totais: dict[str, float] = {}
+    for l in linhas:
+        nome = " ".join(str(l.get("produto") or "").split())
+        if not nome:
+            continue
+        pid = obter_ou_criar_produto(dados, nome, hoje_iso)
+        totais[pid] = totais.get(pid, 0) + float(l.get("quantidade") or 1)
+        if l.get("talao"):
+            dados.setdefault("aliases", {})[chave_alias(l["talao"])] = pid
+    ids = []
+    for pid, q in totais.items():
+        ids += registar_compra(dados, pid, q, data_iso, hoje_iso)
+        dados["compras"][-1]["origem"] = origem
+    return ids
+
+
+def leituras_hoje(dados: dict, hoje_iso: str) -> int:
+    return int(dados.get("leituras", {}).get(hoje_iso, 0))
+
+
+def registar_leitura(dados: dict, hoje_iso: str):
+    """Conta um talão lido hoje (e esquece os dias antigos)."""
+    leit = {k: v for k, v in dados.get("leituras", {}).items() if k >= hoje_iso[:8]}  # mesmo mês
+    leit[hoje_iso] = leit.get(hoje_iso, 0) + 1
+    dados["leituras"] = leit
 
 
 def remover_compras(dados: dict, ids) -> int:
